@@ -1,0 +1,489 @@
+# **FIX 用户密码自动轮换系统 — MVP 方案总结**
+
+
+
+MVP 设计方案
+
+基于 QuickFIX/J + FIX Logon
+
+
+
+## **一、项目目标**
+
+当 FIX 用户密码即将过期时，系统能够安全地更新密码，并让 QuickFIX/J 使用新密码重新登录，确认 FIX Session 恢复正常。
+
+**核心目标：先跑通完整闭环，再考虑通用化。**
+
+本项目部署在银行侧。银行使用 QuickFIX/J 作为 FIX Client / Initiator，连接交易中心的 FIX Server / Acceptor。
+
+交易中心负责管理银行的 FIX 登录账户，并支持通过 FIX 协议提供密码修改能力。
+
+## **二、整体架构**
+
+第一阶段只保留五个模块，不拆微服务，不建设复杂的平台。
+
+银行侧 · MVP 系统
+
+**FIX Password Rotation Service**
+
+统一管理密码生命周期和轮换流程
+
+**1. Credential Manager**
+
+凭据管理、密码版本、过期时间
+
+**2. Rotation Scheduler**
+
+定时检查、触发轮换
+
+**3. Password Rotation Service**
+
+生成密码、编排轮换
+
+**4. FIX Session Manager**
+
+Logout、Logon、Reconnect
+
+**5. Audit & Alert**
+
+记录轮换过程、审计结果、异常告警
+
+**QuickFIX/J**
+
+FIX Client / Initiator
+
+**交易中心 FIX Gateway**
+
+FIX Server / Acceptor · 管理认证账户和密码
+
+## **三、五个模块的具体职责**
+
+### **1. Credential Manager — 凭据管理**
+
+负责管理 FIX 登录凭据。
+
+主要功能：
+
+- FIX 用户名。
+- 当前密码的安全引用。
+- 待生效密码的安全引用。
+- 密码过期时间。
+- 密码轮换周期。
+- 当前密码版本。
+- 凭据状态。
+
+建议使用两个密码版本：
+
+| 版本 | 状态      | 说明             |
+| -- | ------- | -------------- |
+| P1 | ACTIVE  | 当前有效密码         |
+| P2 | PENDING | 已生成，等待交易中心确认修改 |
+
+密码明文不能存储在数据库中。
+
+MVP 可以使用本地加密 Secret Store，后续再接入 Vault 等专业密钥管理系统。
+
+### **2. Rotation Scheduler — 定时调度**
+
+负责自动检查密码有效期。
+
+主要功能：
+
+- 定期检查 FIX 用户密码。
+- 根据过期时间判断是否需要轮换。
+- 到达提前轮换阈值时触发任务。
+- 防止同一个账户重复触发轮换。
+- 记录任务执行时间和状态。
+
+例如：
+
+假设密码有效期为 90 天，提前 7 天触发轮换。
+
+第 1 天
+
+第 83 天
+
+第 90 天
+
+正常使用 P1
+
+触发轮换
+
+密码到期
+
+具体轮换时间还应考虑交易窗口、对端限制和双方约定。
+
+### **3. Password Rotation Service — 密码轮换服务**
+
+这是整个系统的业务编排中心。
+
+主要功能：
+
+1. 接收 Scheduler 的轮换任务。
+2. 生成符合交易中心密码策略的新密码 P2。
+3. 将 P2 安全保存为 PENDING。
+4. 通知 FIX Session Manager 执行密码修改 Logon。
+5. 接收密码修改结果。
+6. 根据结果更新密码版本。
+7. 失败时保留必要凭据，进入恢复流程。
+
+它不直接操作 QuickFIX/J 的底层 Session，而是通过 FIX Session Manager 完成连接管理。
+
+### **4. FIX Session Manager — FIX Session 管理**
+
+负责与 QuickFIX/J 集成。
+
+这是本项目最重要的技术模块。
+
+主要功能：
+
+- 管理 FIX Session。
+- 控制 Logout。
+- 准备携带密码修改字段的 Logon。
+- 接收并解析交易中心响应。
+- 处理 Session 重连。
+- 确认 Session 恢复。
+- 确保后续 Logon 使用新密码。
+
+特别注意：**密码修改不是在已建立的 FIX Session 中直接修改，而是通过新的 Logon 消息发起。**
+
+### **5. Audit & Alert — 审计与告警**
+
+负责记录完整的密码轮换过程。
+
+主要记录：
+
+- 轮换任务 ID。
+- FIX 账户。
+- 旧密码版本、新密码版本。
+- 轮换开始和结束时间。
+- 密码修改请求结果。
+- 交易中心响应状态。
+- FIX Session Logout / Logon 结果。
+- Session 是否恢复。
+- 失败原因。
+- 告警状态。
+
+安全要求：
+
+- 不记录密码明文。
+- 不记录 Tag 554、925 的明文。
+- 不记录包含敏感认证信息的完整 FIX Message。
+- 异常日志需要脱敏。
+
+## **四、密码修改的核心技术：FIX Logon + Tag 925**
+
+这是本次方案调整的重点。
+
+FIX 协议定义了在 Logon 阶段提交新密码的机制。
+
+相关字段：
+
+| Tag  | 字段            | 含义                            |
+| ---- | ------------- | ----------------------------- |
+| 35   | MsgType       | A，Logon                       |
+| 553  | Username      | FIX 用户名                       |
+| 554  | Password      | 当前密码                          |
+| 925  | NewPassword   | 新密码                           |
+| 1409 | SessionStatus | Session 状态（具体含义依 FIX 版本及对端规范） |
+
+例如，银行侧 QuickFIX/J 发起 Logon：
+
+```
+35=A
+553=bank_user
+554=current_password
+925=new_password
+```
+
+其业务含义是：
+
+- 银行提交当前有效密码 P1。
+- 银行同时提交准备修改的新密码 P2。
+- 交易中心验证 P1。
+- 交易中心检查 P2 是否符合密码策略。
+- 交易中心按约定更新认证密码。
+
+需要明确：
+
+**FIX 标准定义了 Tag 925，但不代表所有交易中心都实现了该机制。**
+
+开发前必须取得交易中心的 FIX 接口规范，确认：
+
+1. 是否支持 Logon（35=A）中的 Tag 925。
+2. 是否要求使用特定 FIX 版本，例如 FIX 5.0 SP2。
+3. 密码修改成功后，是否在同一次 Logon 中直接建立 Session。
+4. 密码修改失败时返回什么消息和状态。
+5. 是否支持 Tag 1409，以及实际支持哪些状态值。
+6. 密码修改成功后，旧密码是否立即失效。
+
+另外，FIX 还定义了 `User Request（35=BE）` 等用户管理机制，但第一阶段建议只针对交易中心实际支持的 Logon + Tag 925 方式实现，不同时开发多种机制。
+
+## **五、完整自动轮换流程**
+
+假设当前密码为 P1，需要更新为 P2。
+
+## **Password Rotation Lifecycle**
+
+1. **检测密码即将过期**
+
+   Rotation Scheduler 检查密码有效期，触发轮换。
+2. **生成新密码 P2**
+
+   Password Rotation Service 生成新密码，并安全保存为 PENDING。
+
+   此时 P1 仍是当前有效凭据。
+3. **准备密码修改 Logon**
+
+   FIX Session Manager 安排受控的 Session 切换，在 Logon 中注入：
+   ```
+   554=P1
+   925=P2
+   ```
+4. **交易中心验证并修改密码**
+
+   交易中心根据双方约定验证 P1，检查 P2，更新认证凭据。
+5. **接收交易中心响应**
+
+   检查 Logon 响应、密码修改状态及对端定义的错误信息。
+6. **确认 P2 已生效**
+
+   Password Rotation Service 将 P2 从 PENDING 更新为 ACTIVE。
+
+   P1 不再作为当前密码使用。
+7. **确认 FIX Session 恢复**
+
+   检查 QuickFIX/J 的 Session 状态、Logon 成功回调和业务消息收发。
+8. **审计和告警**
+
+   Audit & Alert 记录完整结果，轮换成功则结束任务，失败则告警。
+
+这里需要特别强调一个实际实现细节：
+
+如果交易中心支持密码修改和 Session 建立在同一次 Logon 中完成，那么不需要为了修改密码而先 Logout、再发送第二次 Logon。
+
+但如果当前 Session 已经建立，通常需要安排 Session 断开后再发起新的 Logon。具体由交易中心的协议实现决定。
+
+## **六、密码轮换状态机**
+
+为了避免密码已经修改、但 Session 尚未恢复时出现状态混乱，MVP 需要一个简单状态机。
+
+| 状态          | 含义                 |
+| ----------- | ------------------ |
+| `ACTIVE`    | 当前密码正常使用           |
+| `PENDING`   | 新密码已经生成并安全保存       |
+| `ROTATING`  | 正在发起密码修改 Logon     |
+| `ROTATED`   | 已确认交易中心修改密码成功      |
+| `CONNECTED` | 新密码登录成功，Session 恢复 |
+| `FAILED`    | 轮换失败，需要处理          |
+
+特别区分：
+
+- `ROTATED`：交易中心已经修改密码。
+- `CONNECTED`：QuickFIX/J 已经成功使用新密码建立 Session。
+
+这两个状态不能合并。
+
+例如，交易中心已经接受 P2，但网络突然断开，此时系统应使用 P2 重连，而不是再次使用 P1 发起密码修改。
+
+## **七、异常处理与安全设计**
+
+| 异常场景              | 系统处理              |
+| ----------------- | ----------------- |
+| 新密码生成失败           | 结束任务，保留 P1        |
+| P2 保存失败           | 不发送密码修改 Logon     |
+| 交易中心拒绝 P1         | 保留凭据，告警           |
+| P2 不符合密码策略        | 根据响应调整或终止轮换       |
+| 交易中心响应超时          | 查询或核实对端状态，不盲目重发   |
+| 对端已修改 P2，但连接断开    | 使用 P2 重新连接        |
+| P2 Logon 失败       | 停止自动重试修改操作，进入恢复处理 |
+| Session 恢复但业务消息异常 | 记录异常，不将任务判定为完全成功  |
+
+还有几个必须遵守的技术约束：
+
+1. 保留 QuickFIX/J MessageStore。
+2. 不要为了密码轮换随意设置 `ResetOnLogon=Y`。
+3. 多个 FIX Session 时，只影响需要轮换的 Session，不要停止整个 Initiator。
+4. 不要在 `toAdmin()` 回调中同步访问远程 Vault。
+5. 对端密码修改操作必须考虑超时、幂等性和结果不确定性。
+6. 如果对端修改后立即废止旧密码，必须在发送请求前持久化 P2。
+
+## **八、MVP 技术选型**
+
+建议采用简单的 Spring Boot 单体工程。
+
+| 技术                | 用途         |
+| ----------------- | ---------- |
+| Java 21           | 开发语言       |
+| Spring Boot 3.x   | 应用框架       |
+| QuickFIX/J        | FIX Engine |
+| PostgreSQL        | 账户和轮换记录    |
+| Spring Data JPA   | 数据访问       |
+| Spring Scheduler  | 定时任务       |
+| JUnit 5           | 自动化测试      |
+| 本地加密 Secret Store | 密码安全存储     |
+
+第一阶段不需要 Kubernetes、微服务、消息队列或复杂的策略引擎。
+
+### **项目结构**
+
+```
+fix-password-rotation/
+│
+├── pom.xml
+│
+└── src/main/java/com/example/fixrotation/
+    │
+    ├── controller/
+    │   └── RotationController.java
+    │
+    ├── service/
+    │   ├── CredentialService.java
+    │   ├── RotationService.java
+    │   └── FixSessionService.java
+    │
+    ├── scheduler/
+    │   └── RotationScheduler.java
+    │
+    ├── fix/
+    │   └── FixApplication.java
+    │
+    ├── model/
+    │   ├── Credential.java
+    │   └── RotationRecord.java
+    │
+    ├── repository/
+    │   ├── CredentialRepository.java
+    │   └── RotationRepository.java
+    │
+    └── config/
+        └── FixConfig.java
+```
+
+## **九、数据库设计**
+
+MVP 只需要两张核心业务表，密码明文放在独立的加密存储中。
+
+**1. fix_credential**
+
+| 字段                   | 说明        |
+| -------------------- | --------- |
+| id                   | 凭据 ID     |
+| account_id           | FIX 账户 ID |
+| username             | FIX 用户名   |
+| password_ref         | 当前密码引用    |
+| pending_password_ref | 待生效密码引用   |
+| password_version     | 当前密码版本    |
+| expires_at           | 密码过期时间    |
+| rotation_days        | 轮换周期      |
+| status               | 凭据状态      |
+| updated_at           | 更新时间      |
+
+**2. fix_rotation_record**
+
+| 字段            | 说明        |
+| ------------- | --------- |
+| id            | 轮换记录 ID   |
+| account_id    | FIX 账户 ID |
+| old_version   | 旧密码版本     |
+| new_version   | 新密码版本     |
+| status        | 轮换状态      |
+| started_at    | 开始时间      |
+| completed_at  | 完成时间      |
+| error_message | 脱敏后的错误信息  |
+
+## **十、API 设计**
+
+MVP 提供四个基础接口：
+
+| API                             | 功能        |
+| ------------------------------- | --------- |
+| `GET /api/credentials`          | 查询 FIX 凭据 |
+| `GET /api/credentials/{id}`     | 查询指定凭据    |
+| `POST /api/rotation/{id}`       | 手动触发密码轮换  |
+| `GET /api/rotation/{id}/status` | 查询轮换状态    |
+
+自动轮换由 Scheduler 触发，手动轮换用于测试和运维。
+
+所有操作接口需要身份认证和授权，不能暴露密码明文。
+
+## **十一、实施阶段**
+
+我建议分成四个阶段，不要一开始就接入真实银行生产 FIX 环境。
+
+1. **阶段 1：基础凭据管理**
+   - 建立 Spring Boot 工程。
+   - 实现 Credential Manager。
+   - 实现密码生成和加密保存。
+   - 实现轮换记录。
+   - 实现四个 API。
+
+   基础功能验收
+2. **阶段 2：FIX 密码修改**
+   - 集成 QuickFIX/J。
+   - 实现 Logon Tag 554 和 Tag 925。
+   - 解析交易中心的响应。
+   - 使用模拟 FIX Acceptor 验证流程。
+
+   密码修改闭环
+3. **阶段 3：Session 恢复**
+   - 实现 Logout / Reconnect。
+   - 使用新密码重新登录。
+   - 验证 Session 状态。
+   - 验证 MessageStore 和 MsgSeqNum 连续性。
+
+   连接恢复验收
+4. **阶段 4：自动调度和审计**
+   - 实现过期检查。
+   - 实现自动轮换。
+   - 实现失败处理和告警。
+   - 完成端到端测试。
+
+   MVP 完整闭环
+
+## **十二、最终验收标准**
+
+MVP 不以「密码已经写入数据库」作为完成标准，而是必须验证整个业务闭环。
+
+| 验收项      | 通过标准                 |
+| -------- | -------------------- |
+| 密码生成     | 能生成符合对端策略的新密码        |
+| 安全存储     | 密码明文不进入数据库和日志        |
+| FIX 密码修改 | 交易中心确认 P2 修改成功       |
+| Logon    | QuickFIX/J 使用新密码登录成功 |
+| Session  | Session 恢复正常         |
+| 序列号      | MsgSeqNum 正常延续       |
+| 业务消息     | 能正常收发 FIX 业务消息       |
+| 旧密码      | 确认不再作为当前密码使用         |
+| 审计       | 完整记录轮换过程             |
+| 异常处理     | 失败时能够识别状态并告警         |
+
+## **十三、目前需要确认的前置条件**
+
+在正式编码前，最重要的是取得交易中心的 FIX 接口规范。
+
+尤其确认以下内容：
+
+- 交易中心支持 `Logon（35=A）` 中的 `NewPassword（925）`。
+- 交易中心支持的 FIX 版本和 Data Dictionary。
+- 密码修改成功后是否直接建立 Session。
+- 密码修改失败时的响应格式和状态码。
+- 是否支持 `SessionStatus（1409）`。
+- 旧密码何时失效。
+- 密码修改请求超时后，如何查询实际修改结果。
+
+这些是对端接口的实际能力，不能仅凭 FIX 标准推定。
+
+## **最终方案结论**
+
+# **5 个模块 · 1 个完整闭环**
+
+**银行侧部署密码轮换系统，QuickFIX/J 通过 FIX Logon 的 Tag 925 请求交易中心修改密码，随后使用新密码建立或恢复 FIX Session。**
+
+**第一阶段只解决一件事：**
+
+密码即将过期 → 自动生成新密码 → FIX 协议修改密码 → QuickFIX/J 新密码登录 → Session 恢复 → 审计完成。
+
+**我的建议：先实现一个银行账户、一个交易中心、一个 QuickFIX/J Session 的端到端 MVP。** 等完整闭环验证成功后，再考虑多银行、多账户和通用凭据管理。
+
+这份方案可以作为后续开发的 MVP 基线。
