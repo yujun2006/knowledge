@@ -1,0 +1,240 @@
+这份材料主要讨论的是：**如何在金融交易系统中，对运行中的 FIX Connect 进行自动化密码轮换，以及如何将这项能力抽象成企业级的通用凭据生命周期管理平台。**
+
+我把全文整理成 5 个核心部分。
+
+# **一、核心问题：FIX 密码为什么需要轮换？**
+
+FIX（Financial Information eXchange）是金融机构之间进行交易通信的标准协议。
+
+典型场景：
+
+- 券商与交易所。
+- 券商与银行。
+- 基金与券商。
+- 交易系统与流动性提供商（LP）。
+
+FIX 通常使用 TCP 长连接。
+
+在 FIX Logon（35=A）阶段，通过以下字段进行身份认证：
+
+| Tag | 字段           | 含义  |
+| --- | ------------ | --- |
+| 553 | Username     | 用户名 |
+| 554 | Password     | 密码  |
+| 49  | SenderCompID | 发送方 |
+| 56  | TargetCompID | 接收方 |
+
+问题在于：
+
+FIX Session 通常长期运行，而密码可能有 30、60、90 或 180 天的有效期。
+
+因此，密码轮换不能简单理解为修改配置文件，而必须考虑：
+
+1. 新密码从哪里获取？
+2. 如何安全更新？
+3. 如何让运行中的 FIX Session 使用新密码？
+4. 如何保证交易不中断？
+5. 如何确认旧密码已经失效？
+
+**特别注意：FIX 协议本身没有规定必须每 90 天更换密码，周期通常来自机构安全政策或交易对手方要求。**
+
+# **二、技术方案：如何实现自动密码轮换？**
+
+材料推荐的核心架构是：
+
+**Secret Manager / Vault**
+
+存储当前密码、新密码、凭证版本和有效期
+
+**FIX Credential Rotation Service**
+
+到期监控、密码生成、轮换调度、状态管理、审计
+
+**FIX Session Manager**
+
+协调 Logout、Reconnect、Logon 和失败回滚
+
+**QuickFIX / QuickFIX-J**
+
+使用新凭证建立 FIX Session
+
+其中有一个重要的技术设计：
+
+**不要将密码轮换逻辑直接写进 FIX Engine，而应该由独立的 Credential Rotation Service 管理。**
+
+对于 QuickFIX/J，材料推荐利用 `Application.toAdmin()` 回调，在发送 Logon 消息时动态注入密码。
+
+例如：
+
+```
+@Override
+public void toAdmin(Message message, SessionID sessionID) {
+    if (isLogon(message)) {
+        FixCredential credential =
+            credentialProvider.getCurrentCredential(sessionID);
+
+        message.setString(
+            Username.FIELD, credential.username()
+        );
+
+        message.setString(
+            Password.FIELD, credential.password()
+        );
+    }
+}
+```
+
+这样做的好处：
+
+- 不需要修改 QuickFIX/J 配置文件。
+- 不需要将密码硬编码在代码中。
+- 新密码激活后，下次 Logon 自动使用新密码。
+- 可以统一接入 Vault 等凭据管理系统。
+
+生产环境还应提前缓存凭证，不要在 `toAdmin()` 回调中同步请求 Vault，以免阻塞 FIX Engine 消息线程。
+
+# **三、最关键的问题：如何保证交易连续性？**
+
+这是整个方案中最重要的部分。
+
+假设：
+
+- 当前密码：Password A
+- 新密码：Password B
+- FIX Session：正在运行
+- 密码即将到期
+
+有两种情况。
+
+**情况 A：交易对手方支持新旧密码并行**
+
+优先推荐
+
+1. 对端创建 Password B。
+2. Vault 保存新密码。
+3. FIX Session 执行受控 Logout。
+4. FIX Engine 自动重连。
+5. 新 Logon 使用 Password B。
+6. 收到 Logon ACK，确认连接成功。
+7. 废止 Password A。
+
+**情况 B：交易对手方不支持新旧密码并行**
+
+1. 提前与交易对手方约定切换窗口。
+2. 准备新密码。
+3. 双方协调更新认证系统。
+4. 断开旧 FIX Session。
+5. 使用新密码重新 Logon。
+6. 检查消息序列号和交易消息恢复情况。
+
+这里有一个非常重要的原则：
+
+**密码轮换不等于 FIX Session 重置。**
+
+重新连接时，通常必须保留原有 MessageStore 和 MsgSeqNum。
+
+不要为了更换密码而随意设置 `ResetOnLogon=Y`，否则可能导致消息序列号重置、成交回报丢失或对账问题。
+
+# **四、从密码轮换升级为通用凭据管理**
+
+材料后半部分提出了一个更有价值的架构思路。
+
+不要把它设计成：
+
+`FIX Password Rotation System`
+
+而应该设计成：
+
+# **Credential Lifecycle Management**
+
+### 统一接入凭据生命周期管理
+
+管理所有外部系统的接入凭据，而不只是 FIX 密码。
+
+**四个核心领域对象**
+
+| 对象                 | 职责     |
+| ------------------ | ------ |
+| Credential         | 一组接入凭据 |
+| CredentialPolicy   | 凭据轮换策略 |
+| CredentialRotation | 一次轮换任务 |
+| CredentialAudit    | 轮换审计记录 |
+
+**四个核心流程**
+
+1. **Monitor**
+
+   监控凭据有效期，提前告警。
+2. **Rotate**
+
+   生成新凭据并安全保存。
+3. **Verify**
+
+   使用新凭据重新建立连接或调用。
+4. **Retire**
+
+   确认新凭据生效后废止旧凭据。
+
+这个通用框架可以支持：
+
+| 接入类型       | 需要管理的凭据             |
+| ---------- | ------------------- |
+| FIX        | Username / Password |
+| 交易所 API    | API Key / Secret    |
+| 银行 SFTP    | 用户名 / 密码 / SSH Key  |
+| 行情供应商      | Token               |
+| 数据库        | Connection Password |
+| Kafka / MQ | SASL 凭据             |
+| 云平台        | AccessKey / Secret  |
+
+这意味着未来增加新的接入系统，不必重新开发一套密码轮换机制。
+
+# **五、最终应该如何设计？**
+
+我认为可以采用以下状态机管理凭据：
+
+1. **ACTIVE**
+
+   当前有效
+
+   当前正在使用的凭据。
+2. **PENDING**
+
+   新凭据已经生成，但尚未验证。
+3. **VERIFIED**
+
+   新凭据已经验证通过，等待切换。
+4. **DEPRECATED**
+
+   旧凭据进入过渡期，可以用于必要的回滚。
+5. **REVOKED**
+
+   旧凭据彻底废止。
+
+每一次轮换都应该有完整的审计记录：
+
+- 哪个账户需要轮换？
+- 谁触发了轮换？
+- 什么时候生成新密码？
+- 什么时候切换成功？
+- FIX Logon 是否成功？
+- 旧密码什么时候废止？
+- 如果失败，是否回滚？
+
+# **六、我的最终总结**
+
+这份材料实际上有三个层次的价值：
+
+| 层次         | 解决的问题        | 核心技术                            |
+| ---------- | ------------ | ------------------------------- |
+| 第一层：FIX 接入 | FIX 密码怎么换    | QuickFIX/J、toAdmin()            |
+| 第二层：运行保障   | 换密码如何不影响交易   | Session Manager、重连、序列号恢复        |
+| 第三层：平台架构   | 如何统一管理所有外部凭据 | Credential Lifecycle Management |
+
+**我的架构建议：不要只开发一个 FIX 密码自动轮换功能，而是建设一个统一的 Credential Lifecycle Management 服务，再通过 FIX Adapter 接入 QuickFIX / QuickFIX-J。**
+
+这样既解决眼前的 FIX 密码 90 天轮换问题，也为未来银行、交易所、SFTP、API、数据库等外部系统提供统一能力。
+
+最值得记住的一句话：
+
+**轮换的核心不是修改密码，而是确保新凭据安全生成、正确生效、连接验证成功，并且旧凭据可靠废止。**
